@@ -76,6 +76,7 @@ from gevent._util import _NONE
 from gevent._util import copy_globals
 
 from gevent.greenlet import Greenlet, joinall, killall
+from greenlet import GreenletExit
 spawn = Greenlet.spawn
 import subprocess as __subprocess__
 # We need our sockets (at least those involved in launching children)
@@ -302,14 +303,20 @@ else:
     fork = monkey.get_original('os', 'fork')
     from gevent.os import fork_and_watch
 
-    class _ForkedChildSpawn(BaseException):
+    class _ForkedChildSpawn(GreenletExit):
         """
         Raised in a forked child that tries to spawn again before it has
         ``exec``'d.
 
-        Deliberately a :exc:`BaseException`: it is raised into a copy of a
-        greenlet, in a process that is about to be replaced by ``exec``, and
-        nothing there should be able to swallow it and carry on.
+        A :exc:`GreenletExit`, because the greenlet it lands in is a *copy*
+        that must simply stop: gevent reports it as a successful exit, so it
+        prints no traceback and :func:`~gevent.joinall` with ``raise_error``
+        does not re-raise it. Both matter, because every frame it would unwind
+        through is a copy too, and the child must stay alive and scheduling
+        long enough for the greenlet that actually forked it to reach ``exec``.
+
+        Being a :exc:`BaseException` (as :exc:`GreenletExit` is), no
+        ``except Exception`` along the way can swallow it and carry on.
 
         .. versionadded:: 26.7.1
         """
