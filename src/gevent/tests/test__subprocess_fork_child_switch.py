@@ -34,6 +34,11 @@ if hasattr(os, 'register_at_fork'):
 
 class Test(greentest.TestCase):
 
+    # Well under a second here, but a Python-level fork/exec ten times over is
+    # slow enough under coverage on a busy CI runner to reach the 15 second
+    # default, which it did.
+    __timeout__ = 60
+
     # Each capture is checked against one child lifetime; a splice shows up as an
     # exact multiple of it. Two greenlets are enough to overlap, three make it prompt.
     GREENLETS = 3

@@ -492,6 +492,16 @@ class _ForkHooks:
                 types.append(base)
         return tuple(types)
 
+    @staticmethod
+    def _multiplexed_watcher_type():
+        # libuv multiplexes io: one ``uv_poll_t`` serves every wait on a given
+        # fd, and what a greenlet parks on is one of these, which is not a
+        # ``watcher`` at all. Miss it and that backend's socket waits, the ones
+        # this is most needed for, are invisible.
+        mod = sys.modules.get('gevent.libuv.watcher')
+        multiplexed = getattr(getattr(mod, 'io', None), '_multiplexwatcher', None)
+        return multiplexed if isinstance(multiplexed, type) else None
+
     @classmethod
     def _cancel_pending_waits_in_child(cls):
         # The queue above only holds greenlets that were *runnable*. One that
@@ -503,21 +513,30 @@ class _ForkHooks:
         # sequence number, and on an inherited pipe it consumes bytes the
         # parent was capturing.
         #
-        # A watcher that is active at fork time is active precisely because
-        # something is parked on it, and gevent's watchers are created once per
-        # object and started and stopped around each wait. Stopping one here
-        # therefore cancels the pending resume without damaging the object: the
-        # child's next wait on that socket or file starts it again. That is what
-        # makes this safe for a child that carries on using what it inherited,
-        # which a child of a plain ``os.fork()`` is entitled to do.
+        # What identifies such a copy is the watcher's callback. gevent sets it
+        # when a greenlet begins waiting and clears it when the wait ends, so a
+        # watcher whose callback is a ``Waiter.switch`` is one a greenlet is
+        # blocked on. Cancelling that resume is all this does, and only for other
+        # greenlets: everything else belongs to the application and keeps
+        # working, notably signal handlers (which a child inherits by ordinary
+        # POSIX rules) and ``Timeout``, whose timer may belong to a ``with``
+        # block the forking greenlet is still inside.
         #
-        # Only waits are cancelled, and only other greenlets' waits. A watcher
-        # whose callback is a ``Waiter.switch`` is one a greenlet is blocked on;
-        # anything else belongs to the application and keeps working, notably
-        # signal handlers (which a child inherits by ordinary POSIX rules) and
-        # ``Timeout``, whose timer may belong to a ``with`` block the forking
-        # greenlet is still inside.
-        watcher_types = cls._watcher_types()
+        # Do not ask instead whether the watcher is active or pending. Under
+        # libuv neither flag can answer this: an expired timer has already been
+        # stopped by the time its callback is dispatched, and ``pending`` there
+        # is the inherited constant ``False``, so a greenlet whose ``sleep`` has
+        # just come due looks idle in the very window a fork is most likely to
+        # land in.
+        #
+        # Whatever the wait was on has to come out of this fit to use. A child of
+        # a plain ``os.fork()`` may carry on using the objects it inherited,
+        # which is what :mod:`gevent.os` documents and what gevent's own
+        # bind/fork/accept server pattern needs, so the wait is what gets
+        # cancelled, never the object. Stopping the watcher says exactly that on
+        # every backend but one; see the socket case below.
+        multiplexed = cls._multiplexed_watcher_type()
+        watcher_types = cls._watcher_types() + ((multiplexed,) if multiplexed else ())
         if not watcher_types:
             return
         # Local import: gevent.hub imports us, so this cannot be at module
@@ -527,23 +546,33 @@ class _ForkHooks:
         for obj in gc.get_objects():
             if not isinstance(obj, watcher_types):
                 continue
-            try:
-                # ``active`` is not enough. A watcher that has already fired is
-                # inactive but still *pending*: the loop has collected its event
-                # and has yet to invoke the callback, which it will do in the
-                # child. That is the common case for a greenlet parked in a
-                # short ``sleep``. Stopping a watcher clears its pending event
-                # as well as deactivating it.
-                if not obj.active and not obj.pending:
-                    continue
-                waiter = getattr(obj.callback, '__self__', None)
-            except AttributeError: # pragma: no cover
-                continue
+            waiter = getattr(getattr(obj, 'callback', None), '__self__', None)
             if not isinstance(waiter, Waiter):
                 continue
             if waiter.greenlet is None or waiter.greenlet is current:
                 continue
-            obj.stop()
+            if multiplexed is not None and isinstance(obj, multiplexed):
+                # The socket case. Cancel the wait and leave the loop's
+                # registration of the descriptor alone: ``stop`` would also
+                # deregister it, and libuv does that immediately, with an
+                # ``epoll_ctl`` on a descriptor the child inherited rather than
+                # on memory it copied. That is the parent's own epoll set, and
+                # the parent goes on to wait forever for a socket it will never
+                # hear about again. (libev batches the same call until its next
+                # loop iteration, which a child that ``exec``s never reaches, and
+                # ``reinit`` gives a child that keeps running an epoll set of its
+                # own. libuv's ``reinit`` cannot; see the comment on it.)
+                #
+                # Stopping short leaves nothing dangling. The registration is
+                # shared with the other waits on that descriptor, the child's own
+                # next wait recomputes it from the watchers that still hold a
+                # callback, and in between the loop hands an event to a watcher
+                # with none, which it is written to skip.
+                obj.callback = None
+                obj.args = None
+                obj.pass_events = None
+            else:
+                obj.stop()
 
     def after_fork_in_child(self):
         # We've already imported threading, which installed its "after" hook,

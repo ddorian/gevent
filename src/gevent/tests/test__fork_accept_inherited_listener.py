@@ -7,11 +7,16 @@ requires the child to keep using the objects those greenlets were blocked on,
 which is what gevent's bind/fork/accept server pattern does and what
 :mod:`gevent.os` documents as supported.
 
-Cancelling a wait in the child must therefore stop the watcher without damaging
-it: the child's own ``accept`` has to start it again. The second case here is the
-one that pins that down, because there the listener's io watcher is active at the
+Cancelling a wait in the child must therefore leave the object it was waiting on
+fit to use: the child's own ``accept`` has to work. The second case here is the
+one that pins that down, because there the listener's io watcher is live at the
 moment of the fork, and a child that inherits it still holding the parent's
 accept raises ``ConcurrentObjectUseError`` instead of serving.
+
+Run it under both backends. What the child may do to reach that state differs:
+libuv registers a given fd with its epoll set once and shares that registration
+between every wait on it, so there a wait has to be cancelled without stopping
+the watcher at all.
 """
 from gevent import monkey; monkey.patch_all() # pragma: testrunner-no-monkey-combine
 

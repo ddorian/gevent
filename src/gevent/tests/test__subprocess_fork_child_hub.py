@@ -33,6 +33,11 @@ if hasattr(os, 'register_at_fork'):
 
 class Test(greentest.TestCase):
 
+    # Well under a second here, but a Python-level fork/exec ten times over is
+    # slow enough under coverage on a busy CI runner to reach the 15 second
+    # default, which it did.
+    __timeout__ = 60
+
     WORKERS = 4
     SPAWNS = 10
 

@@ -8,19 +8,31 @@ record the parent will write again under the same sequence number, drawing
 ``bad_record_mac`` from the server, and on an inherited pipe it consumes bytes
 the parent was capturing.
 
-A watcher that is active at fork time is active precisely because something is
-parked on it, and gevent's watchers are created once per object and started and
-stopped around each wait, so stopping one in the child cancels the pending
-resume without damaging the object. The child's next wait on that socket or file
-starts it again, which is what lets a child of a plain ``os.fork()`` carry on
-using what it inherited, as :mod:`gevent.os` documents and as gevent's own
-bind/fork/accept server pattern requires.
+What identifies such a copy is the watcher's callback: gevent sets it when a
+greenlet starts waiting and clears it when the wait ends, so a watcher whose
+callback is a ``Waiter.switch`` is one a greenlet is blocked on. The watcher's
+``active`` and ``pending`` flags cannot answer this. Under libuv an expired timer
+has already been stopped by the time its callback is dispatched, and ``pending``
+there is a constant ``False``, so a greenlet whose ``sleep`` has just come due
+looks idle in the very window a fork is most likely to land in.
 
-Only waits are cancelled, and only other greenlets' waits. A watcher whose
-callback is a ``Waiter.switch`` is one a greenlet is blocked on; anything else is
-left alone, including signal handlers, which a child inherits by ordinary POSIX
-rules, and :class:`gevent.Timeout`, whose timer may belong to a ``with`` block
-the forking greenlet is still inside.
+Only waits are cancelled, and only other greenlets'. Anything else is left alone,
+including signal handlers, which a child inherits by ordinary POSIX rules, and
+:class:`gevent.Timeout`, whose timer may belong to a ``with`` block the forking
+greenlet is still inside.
+
+The cancellation also stops at the wait. A child of a plain ``os.fork()`` may
+legitimately carry on using the objects it inherited, as :mod:`gevent.os`
+documents and as gevent's own bind/fork/accept server pattern requires, so
+whatever the wait was on has to come out of this fit to use. Under libuv that
+rules out stopping the watcher for a socket at all: one ``epoll`` registration
+serves every wait on a given descriptor, and it lives in a descriptor the child
+inherited rather than in memory it copied, so a child that deregistered its own
+wait would silence the parent's socket too, and the parent would wait forever for
+a connection it never hears about. There the callback alone is cleared, which is
+what the loop checks before dispatching. (libev batches the same call until its
+next loop iteration, which a child that ``exec``s never reaches, and ``reinit``
+gives a child that keeps running an ``epoll`` set of its own.)
 
 Finding those watchers costs one ``gc.get_objects()`` walk per fork in the
 child, which measured about 2ms against a 690,000 object heap, against 70ms for

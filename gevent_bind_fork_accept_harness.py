@@ -6,12 +6,13 @@
 
     $ uv run --script gevent_bind_fork_accept_harness.py
     $ SHAPE=accepting uv run --script gevent_bind_fork_accept_harness.py
+    $ SHAPE=accepting GEVENT_LOOP=libuv uv run --script ...
 
-Not a bug reproducer. This guards the fix that cancels the parent's pending
-waits in a forked child, whose safety argument is that stopping a watcher does
-not damage the object it belongs to, so a child can carry on using what it
-inherited. gevent's own bind/fork/accept server pattern is the thing that would
-break if that were wrong, so it has to pass before the fix as well as after.
+This exercises the fix that cancels the parent's pending waits in a forked child
+from the other side. Cancelling a wait must leave the object it was waiting on
+fit to use, because gevent's bind/fork/accept server pattern hands a child a
+listener and expects it to serve on it. Run both shapes under both backends: the
+second shape fails without the fix, and it fails differently on each one.
 
 The parent binds a listener, keeps some greenlets parked so the child has copies
 worth cancelling, and forks. Each child accepts on the inherited listener until
@@ -20,9 +21,9 @@ reply, then waits for the children to exit.
 
     SHAPE=idle       the parent never accepts before forking (the usual pattern)
     SHAPE=accepting  a parent greenlet is already parked in accept() at the
-                     fork, so the listener's io watcher is active and the fix
-                     stops it in the child. The child's own accept() must
-                     start it again.
+                     fork, so the listener's io watcher is live and the fix has
+                     to cancel that wait. The child's own accept() must still
+                     work afterwards, and so must the parent's clients.
 
 A child that never serves, or a client that never gets its bytes back, is the
 failure this is looking for. It shows up as a count, not as an exception.
