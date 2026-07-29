@@ -67,6 +67,7 @@ from gevent.thread import _make_thread_handle
 from gevent.thread import allocate_lock as _allocate_lock
 from gevent.thread import get_ident as _get_ident
 from gevent.hub import sleep as _sleep, getcurrent
+from gevent.hub import _get_hub as _get_hub_if_exists
 from gevent.lock import RLock
 
 
@@ -434,6 +435,46 @@ class _ForkHooks:
                 # over what gets to run.
                 handle._set_done(enter_hub=False)
 
+    @staticmethod
+    def _cancel_pending_switches_in_child():
+        # Making the copies *appear* stopped is not enough.
+        # ``_stop_running_greenlets_in_child`` says as much in its own
+        # comment: "If gevent is still waiting to switch to them, that will
+        # still happen." Every entry on the loop's callback queue is such a
+        # pending switch, and in the child every one of those greenlets is a
+        # copy of one the parent is still running.
+        #
+        # The child does not have to *do* anything to let them run. Handlers
+        # registered with ``os.register_at_fork(after_in_child=)`` run inside
+        # ``fork()``, before it has returned to whoever called it, and under
+        # monkey-patching the ordinary contents of such a handler yield:
+        # ``Thread.start()`` waits on an ``Event``, a patched lock may be held
+        # by another greenlet, ``logging`` takes one. That yield reaches the
+        # child's copy of the hub, which resumes whatever was queued, and the
+        # copies redo work the parent has already done or is doing (a second
+        # INSERT, a second write on an inherited socket). A child that did
+        # nothing but ``os._exit()`` was measured running four of the parent's
+        # greenlets first, on every one of 20 forks.
+        #
+        # Nothing in the queue can belong to the greenlet that forked: that one
+        # is running, not waiting to be switched to.
+        #
+        # Stop each callback where it lies; do NOT discard the queue. Each
+        # callback is the loop's record of a reference it took in
+        # ``run_callback`` and hands back in ``_run_callbacks``, so a discarded
+        # queue leaks one reference per entry, and the child's loop can then
+        # never become unreferenced. It hangs instead of exiting. Stopped
+        # callbacks are still popped, still unref'd, and skipped instead of
+        # run.
+        hub = _get_hub_if_exists()
+        loop = getattr(hub, 'loop', None)
+        queue = getattr(loop, '_callbacks', None)
+        if queue is None:
+            return
+        # list(): both backends iterate their queue by materializing it, but
+        # be explicit, because we are mutating the entries as we go.
+        for cb in list(queue):
+            cb.stop()
 
     def after_fork_in_child(self):
         # We've already imported threading, which installed its "after" hook,
@@ -445,6 +486,7 @@ class _ForkHooks:
         assert get_ident() == self._before_fork_ident
 
         self._stop_running_greenlets_in_child()
+        self._cancel_pending_switches_in_child()
 
         main = __threading__._MainThread()
         main._ident = get_ident() # 3.13: reset to the greenlet version.

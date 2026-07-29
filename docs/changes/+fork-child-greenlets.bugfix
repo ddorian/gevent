@@ -1,0 +1,22 @@
+Stop a forked child from running copies of the parent's greenlets.
+
+Only the greenlet that forked survives a fork, the same way only the calling
+thread does. Everything else in the parent's hub is a copy, and a child that
+resumes one redoes work the parent has already done or is doing.
+
+``gevent.threading._ForkHooks`` already made those copies *appear* stopped to
+:mod:`threading`, but anything on the loop's callback queue is a pending switch
+into one of them, so the child's hub resumed them as soon as anything yielded.
+The first thing that can yield is the next
+``os.register_at_fork(after_in_child=)`` handler, which runs inside ``fork()``
+before it has returned to its caller. Under monkey-patching such handlers do
+yield: ``Thread.start()`` waits on an ``Event``, a patched lock may be held by
+another greenlet, ``logging`` takes one. A child that did nothing at all but
+``os._exit()`` was measured running four of the parent's greenlets first, on
+every one of 20 forks.
+
+Those queued switches are now cancelled in the child. Greenlets parked on a
+timer or an ``io`` watcher are resumed by the loop rather than by that queue,
+and this change does not address them; for the child of
+:mod:`gevent.subprocess`, which may run nothing at all before it ``exec``s, see
+the separate fix that gives it a hub of its own.
