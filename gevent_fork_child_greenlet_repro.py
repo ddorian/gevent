@@ -7,10 +7,6 @@
     uv run gevent_fork_child_greenlet_repro.py          # children do work, exits 1
     YIELD=0 uv run gevent_fork_child_greenlet_repro.py  # control: clean, exits 0
 
-FIXED, on this branch, in gevent/threading.py: the child now starts with an empty
-callback queue, so nothing copied is resumed there. Against a gevent without that
-change this script exits 1.
-
 No subprocess anywhere. A plain ``os.fork()``, one
 ``os.register_at_fork(after_in_child=)`` handler that yields, and worker greenlets
 whose only job is to append a line naming the process that wrote it. The child does
@@ -41,23 +37,21 @@ RELATION TO THE SUBPROCESS SPLICE
 ``gevent_fork_child_switch_repro.py`` is the same root cause with a sharper edge: there
 the copies fork and exec onto the pipe fds of the spawn whose child they are running
 inside, so one ``subprocess.run(capture_output=True)`` returns several complete copies
-of its child's output. Both are fixed, and independently: ``gevent.subprocess`` refuses
-to fork in a child that has not exec'd, and the child no longer resumes copies at all.
+of its child's output. That consequence is fixed in ``gevent.subprocess``. This one ---
+copies running at all --- is not.
 
 MEASURED (CPython 3.14.6, gevent 26.7.1.dev0)
 
     default          -> 80 lines from 20 child pids, out of 20 forks
     YIELD=0          -> 0 lines, 0 pids
 
-THE ATTEMPT THAT LOOKED LIKE IT WORKED
+NOT FIXED
 
-Recorded because it cost a cycle: calling ``hub.loop._callbacks.clear()`` from
-``_ForkHooks.after_fork_in_child``. The hook runs, and nothing changes. ``clear`` on
-the C loop's ``CallbackFIFO`` is a ``cdef`` method, invisible to Python, so the call
-raises ``AttributeError`` --- and an exception inside a fork handler is reported as
-unraisable, i.e. swallowed. A fix that cannot run looks exactly like a fix that does
-not work. The queue has to be *replaced* (``loop._callbacks = type(queue)()``), which
-also works for the CFFI loop's ``deque``.
+An attempt that did not work, recorded so it is not repeated: dropping the loop's
+pending callbacks (``hub.loop._callbacks.clear()``, present on both backends) from
+``_ForkHooks.after_fork_in_child``, which runs first among the child's handlers. The
+hook runs and the queue is cleared --- verified --- and the copies still run. Whatever
+resumes them is some other path.
 """
 
 from gevent import monkey; monkey.patch_all()
