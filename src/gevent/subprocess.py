@@ -302,6 +302,78 @@ else:
     fork = monkey.get_original('os', 'fork')
     from gevent.os import fork_and_watch
 
+    class _ForkedChildSpawn(BaseException):
+        """
+        Raised in a forked child that tries to spawn again before it has
+        ``exec``'d.
+
+        Deliberately a :exc:`BaseException`: it is raised into a copy of a
+        greenlet, in a process that is about to be replaced by ``exec``, and
+        nothing there should be able to swallow it and carry on.
+
+        .. versionadded:: 26.7.1
+        """
+
+    #: The pid of the process currently between ``fork()`` and ``exec()``, or
+    #: `None`. A forked child inherits the *parent's* pid here, which is
+    #: exactly how it recognizes itself as that child.
+    _forking_for_exec_in = None
+
+    def _fork_only_outside_a_forked_child():
+        """
+        ``fork()``, refusing to do so in a child that has not ``exec``'d yet.
+
+        A forked child is a copy of a whole process worth of greenlets, each
+        stopped wherever it happened to be --- including other calls to this
+        very function, holding another spawn's pipe write ends (the parent
+        closes those only once ``fork()`` has returned, and by then the child
+        has ``dup2``'d one onto its own stdout). Let one of those copies run
+        and it forks and execs a second time, and its output arrives on the
+        *first* spawn's pipes. That spawn's capture then holds two complete
+        copies of a child's output; two such children and it holds four. Both
+        pipes double together, because both were inherited together.
+
+        Our own child branch below never switches. But we do not have the
+        child to ourselves: ``os.register_at_fork(after_in_child=)`` handlers
+        run inside ``fork()``, before it returns to us, and applications
+        register them (OpenTelemetry, Sentry, filelock, coverage). Under
+        monkey-patching the ordinary contents of such a handler yield ---
+        ``Thread.start()`` waits on an ``Event``, a patched lock may be held by
+        another greenlet, ``logging`` takes one --- and then the child's copy of
+        the hub runs whatever else is runnable.
+
+        Preventing the switch is not ours to do; greenlet tracing cannot refuse
+        one (a trace function that raises is disabled, so it stops the first
+        switch only). So forbid the damaging consequence instead: between
+        ``fork()`` and ``exec()``, a child may not fork.
+
+        Keyed on pid rather than a bare flag, so the *parent's* own window is
+        unaffected: a greenlet can be parked inside ``fork()`` in the parent
+        (:issue:`1865`) while other greenlets legitimately spawn.
+
+        .. versionadded:: 26.7.1
+        """
+        global _forking_for_exec_in
+        if _forking_for_exec_in is not None and _forking_for_exec_in != os.getpid():
+            raise _ForkedChildSpawn(
+                'a forked child tried to spawn before exec(); this greenlet is a '
+                'copy left runnable by an os.register_at_fork(after_in_child=) '
+                'handler that yielded'
+            )
+
+        _forking_for_exec_in = os.getpid()
+        pid = -1
+        try:
+            # Deliberately a global lookup: instrumentation replaces this.
+            pid = fork()
+        finally:
+            if pid != 0:
+                # Parent, or the fork failed. The child keeps the inherited
+                # value until exec() or os._exit() disposes of it.
+                _forking_for_exec_in = None
+        return pid
+
+
 # Some explicit imports for static analysis
 STDOUT = __subprocess__.STDOUT
 TimeoutExpired = __subprocess__.TimeoutExpired
@@ -1628,7 +1700,8 @@ class Popen(object):
                     # write to stderr -> hang.  http://bugs.python.org/issue1336
                     gc.disable()
                     try:
-                        self.pid = fork_and_watch(self._on_child, self._loop, True, fork)
+                        self.pid = fork_and_watch(self._on_child, self._loop, True,
+                                                  _fork_only_outside_a_forked_child)
                     except:
                         if gc_was_enabled:
                             gc.enable()

@@ -1,0 +1,15 @@
+Stop a forked child from spawning again before it has ``exec``'d.
+
+``gevent.subprocess`` forks and execs in Python, so the child briefly *is* a
+full interpreter holding a copy of every greenlet and of the hub.
+``os.register_at_fork(after_in_child=)`` handlers run inside ``fork()``, before
+that child branch begins, and under monkey-patching the ordinary contents of
+such a handler yield --- ``Thread.start()`` waits on an ``Event``, a patched
+lock may be held, ``logging`` takes one. The child's hub then ran whatever else
+was runnable, including copies of other greenlets mid-spawn, still holding a
+pipe write end this child had already ``dup2``'d onto its stdout. Those copies
+forked and exec'd again onto that same pipe, so a single
+``subprocess.run(capture_output=True)`` could return two, four or eight
+complete copies of its child's output, the same multiple on stdout and stderr.
+
+A child between ``fork()`` and ``exec()`` now refuses to fork.
