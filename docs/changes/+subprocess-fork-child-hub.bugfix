@@ -1,0 +1,41 @@
+Give the child of :mod:`gevent.subprocess` a hub of its own, so that it runs
+none of the parent's greenlets before it ``exec``s.
+
+gevent's POSIX ``_execute_child`` forks and execs in Python, so between
+``fork()`` and ``exec()`` the child is a whole interpreter holding a copy of the
+parent's greenlets, open file descriptors and in-memory TLS sessions. gevent's
+own child branch never switches, but ``os.register_at_fork(after_in_child=)``
+handlers run inside ``fork()`` before that branch begins; applications register
+them (OpenTelemetry, Sentry, ``filelock``, ``coverage``), and under
+monkey-patching the ordinary contents of such a handler yield. The child's copy
+of the hub then resumed the copies, which carried on doing the application's
+work in a process that only existed to ``exec``.
+
+On an inherited TLS connection that corrupts the session. The copy writes a
+record encrypted under the sequence number its copy of the session state says is
+next, the parent reuses that same number, and the server's MAC check fails, so
+it answers ``bad_record_mac`` and closes. Postgres connections (psycopg) and
+HTTPS connections (urllib3/botocore) have both been seen failing that way in one
+process that spawns often.
+
+The theft also runs the other way, and on a pipe it is silent. A copy resumed on
+an inherited pipe *reads*, and those bytes never reach the parent that was
+capturing them. There is no MAC to notice, so the capture is simply short, and
+in the worst case empty: a subprocess that exited 0 whose combined output came
+back as zero bytes.
+
+The child now gets a fresh hub with a loop of its own, which puts the parent's
+watchers, its queued callbacks and its hub greenlet out of reach. (That greenlet
+is suspended inside the parent's ``loop.run()``, and would carry on polling if
+anything ever switched to it.) A fork handler that yields still works; one that
+waits for something only the parent could provide now fails at once instead of
+running application greenlets while it waits.
+
+This also fixes the reproducer in :issue:`2023`, where a fork handler that used
+``gevent.get_hub().threadpool`` deadlocked the spawn: it now gets the child's
+own hub and threadpool instead of the parent's, and completes.
+
+It applies only to the child of :mod:`gevent.subprocess`, which exists to
+``exec`` and nothing else. A child of a plain ``os.fork()`` may legitimately
+keep using the gevent objects it inherited, so it keeps the hub it was given,
+and the same handler still deadlocks there.

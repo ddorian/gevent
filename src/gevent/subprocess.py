@@ -303,6 +303,11 @@ else:
     fork = monkey.get_original('os', 'fork')
     from gevent.os import fork_and_watch
 
+    from gevent.hub import Hub
+    from gevent.hub import set_hub
+    from gevent.hub import set_loop
+    from gevent.hub import _get_hub as _get_hub_if_exists
+
     class _ForkedChildSpawn(GreenletExit):
         """
         Raised in a forked child that tries to spawn again before it has
@@ -323,8 +328,18 @@ else:
 
     #: The pid of the process currently between ``fork()`` and ``exec()``, or
     #: `None`. A forked child inherits the *parent's* pid here, which is
-    #: exactly how it recognizes itself as that child.
+    #: exactly how it recognizes itself as that child. It has to be reachable
+    #: from any greenlet, not just the one that forked, because a copy left
+    #: runnable in the child is a different greenlet entirely.
     _forking_for_exec_in = None
+
+    def _in_pre_exec_child():
+        """
+        Are we a child of :meth:`Popen._execute_child` that has not
+        ``exec``'d yet?
+        """
+        return (_forking_for_exec_in is not None
+                and _forking_for_exec_in != os.getpid())
 
     def _fork_only_outside_a_forked_child():
         """
@@ -361,7 +376,7 @@ else:
         .. versionadded:: 26.7.1
         """
         global _forking_for_exec_in
-        if _forking_for_exec_in is not None and _forking_for_exec_in != os.getpid():
+        if _in_pre_exec_child():
             raise _ForkedChildSpawn(
                 'a forked child tried to spawn before exec(); this greenlet is a '
                 'copy left runnable by an os.register_at_fork(after_in_child=) '
@@ -380,6 +395,71 @@ else:
                 _forking_for_exec_in = None
         return pid
 
+    def _detach_inherited_hub_in_pre_exec_child():
+        """
+        Give a child between ``fork()`` and ``exec()`` a hub of its own,
+        so that it cannot run the parent's greenlets.
+
+        A forked child is a copy of a whole process worth of greenlets,
+        each stopped wherever it happened to be: mid-request on a database
+        connection, mid-handshake on a TLS session. Only the greenlet that
+        forked may continue. The rest are copies and must never run again.
+
+        Our own child branch below never switches, but we do not have the
+        child to ourselves. Handlers registered with
+        ``os.register_at_fork(after_in_child=)`` run inside ``fork()``,
+        before it returns to us, and applications register them
+        (OpenTelemetry, Sentry, ``filelock``, ``coverage``). Under
+        monkey-patching the ordinary contents of such a handler yield:
+        ``Thread.start()`` waits on an ``Event``, a patched lock may be
+        held by another greenlet, ``logging`` takes one. That yield reaches
+        the child's copy of the hub, and the copies run.
+
+        On an inherited TLS connection that corrupts the session. The copy
+        writes a record encrypted under the sequence number its copy of the
+        session state says is next, the parent reuses that same number, and
+        the server's MAC check fails, so it answers ``bad_record_mac`` and
+        closes. Postgres via psycopg and HTTPS via urllib3 have both been
+        seen dying that way in one process that spawns often.
+
+        Cancelling the queued switches is not enough by itself: a copy
+        parked on a timer or on an ``io`` watcher is resumed by the loop,
+        not by the callback queue. Take the whole loop away instead. The
+        child gets a fresh hub, which puts the parent's watchers, its
+        queued callbacks and its hub greenlet out of reach. (That greenlet
+        is suspended inside the parent's ``loop.run()``, and would carry on
+        polling if anything ever switched to it.) A handler that yields
+        still works, on the new empty loop; one that waits for something
+        only the parent could provide now gets
+        :exc:`~gevent.exceptions.LoopExit` at once, which inside a fork
+        handler is reported as unraisable and lets the child get on with
+        ``exec``. Before, it sat there running application greenlets while
+        it waited.
+
+        The child is discarded microseconds later by ``exec`` or
+        ``_exit``, so the hub it is given never has to be tidied up.
+
+        .. versionadded:: 26.7.1
+        """
+        if not _in_pre_exec_child():
+            return
+        if _get_hub_if_exists() is None:
+            # Nothing was ever scheduled in this thread, so there are no
+            # copies to run and nothing to detach.
+            return
+        # ``default=False`` matters: libev's default loop is a
+        # process-wide singleton, so a hub that asked for the default loop
+        # again would be handed the parent's loop, watchers and all.
+        set_loop(None)
+        set_hub(Hub(default=False))
+
+    if hasattr(os, 'register_at_fork'):
+        # Registration order is the order handlers run in the child, so
+        # this must be registered before any application handler --- which
+        # it is, because importing this module is part of
+        # ``monkey.patch_all()``, and gevent must be patched before the
+        # application imports anything that registers its own.
+        os.register_at_fork(after_in_child=_detach_inherited_hub_in_pre_exec_child)
 
 # Some explicit imports for static analysis
 STDOUT = __subprocess__.STDOUT
