@@ -45,8 +45,10 @@ class Test(greentest.TestCase):
 
         def probe():
             for _ in range(self.SPAWNS):
+                # check=False: the exit status is the legitimate child's either way,
+                # so raising on it would only hide the capture that is the diagnosis.
                 completed = subprocess.run([sys.executable, '-c', CHILD],
-                                           capture_output=True)
+                                           capture_output=True, check=False)
                 captures.append((len(completed.stdout), len(completed.stderr)))
 
         gevent.joinall([gevent.spawn(probe) for _ in range(self.GREENLETS)],
