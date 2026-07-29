@@ -361,19 +361,72 @@ else:
     #: listening on at that point.
     _errpipe_write_in_pre_exec_child = None
 
-    def _abort_pre_exec_child(reason):
+    def _abort_pre_exec_child(reason, blocked=()):
         """
         Report *reason* to the parent and kill this child, which has not
         ``exec``'d yet.
+
+        *blocked* is the greenlets that switched into the hub and had not come
+        back, earliest first. The first of them is the answer to the only question
+        worth asking here, which handler did this, and it is nowhere on the stack
+        of whatever calls this: by then that is a timer callback running in the
+        hub, whose own frames are all loop internals.
 
         Never returns. The child is not a process that may keep running: every
         frame in it is a copy, and it holds a clone of every descriptor the
         parent had at the fork.
         """
+        # ``gr_frame`` is where a suspended greenlet stopped, and one that
+        # switched to the hub is suspended by definition. Skip any without a
+        # frame rather than reporting nothing: dead and never-started greenlets
+        # have none, and either could be in here.
+        culprit = frame = None
+        for candidate in blocked:
+            frame = getattr(candidate, 'gr_frame', None)
+            if frame is not None:
+                culprit = candidate
+                break
+        if frame is not None:
+            # In the message, not only on the attribute below. Nothing prints
+            # ``child_traceback`` --- it is there to be read deliberately --- and
+            # what reaches a log or an error tracker is ``str(exc)``. One line
+            # naming the frame is the difference between a report that identifies
+            # the handler and one that says a handler exists.
+            # Outward past gevent's own frames first. The innermost is always the
+            # hub's ``switch``, which names nothing; a step or two out is the
+            # caller that blocked, which is the whole answer. Our own tests are
+            # callers rather than implementation, and they live inside the
+            # package, so they have to be exempted or they would be skipped too.
+            ours = os.path.dirname(os.path.abspath(__file__))
+            callers_of_ours = os.path.join(ours, 'tests')
+            named = frame
+            while named is not None:
+                path = os.path.abspath(named.f_code.co_filename)
+                if not path.startswith(ours) or path.startswith(callers_of_ours):
+                    break
+                named = named.f_back
+            named = named if named is not None else frame
+            reason += ('; it was last at %s:%s in %s(), and its full stack is on '
+                       'this exception\'s child_traceback attribute'
+                       % (named.f_code.co_filename, named.f_lineno,
+                          named.f_code.co_name))
+            child_traceback = [
+                'In the forked child. The greenlet below switched to the hub '
+                'first of the %d that had not come back, so it is the one that '
+                'started this; the others are usually whatever has been keeping '
+                'the loop alive since.\n' % (len(blocked),),
+                '  %r\n' % (culprit,),
+            ] + traceback.format_stack(frame)
+        else:
+            child_traceback = (
+                ['In the forked child, on the hub\'s own stack (the greenlet '
+                 'that blocked could not be identified):\n']
+                + traceback.format_stack()
+            )
         exc = _ForkedChildHubEntry(reason)
         # The attribute the parent's ``_execute_child`` looks for; without it the
         # traceback would be the parent's, which is not where this happened.
-        exc.child_traceback = ''.join(traceback.format_stack())
+        exc.child_traceback = ''.join(child_traceback)
         fd = _errpipe_write_in_pre_exec_child
         if fd is not None:
             try:
@@ -439,17 +492,45 @@ else:
 
         def __init__(self, *args, **kwargs):
             Hub.__init__(self, *args, **kwargs)
+            #: Greenlets currently inside a switch to this hub, against the loop
+            #: time each entered at. Anything still here when the deadline fires
+            #: never came back, and the *earliest* is the one to name. Naming it
+            #: is the point: an application that hits this needs to know which of
+            #: its fork handlers did it, and the child is about to be gone.
+            #:
+            #: The last one to switch in is the wrong answer, which is worth
+            #: saying because it is the tempting one. Whatever is keeping the loop
+            #: alive switches in and out constantly, so it is almost always the
+            #: most recent, and it is a bystander.
+            self._pre_exec_in_switch = {}
             # ``ref=False``: see the class docstring. Held on the instance
             # because a watcher nothing refers to may be collected.
             self._pre_exec_deadline = self.loop.timer(
                 _PRE_EXEC_LOOP_DEADLINE, ref=False)
-            self._pre_exec_deadline.start(
-                _abort_pre_exec_child,
+            self._pre_exec_deadline.start(self._pre_exec_deadline_reached)
+
+        def switch(self):
+            # Not every switch arrives here: the compiled callers hold the hub in
+            # a typed slot and may reach the base implementation directly. That
+            # can only cost the diagnosis its best answer, never the deadline,
+            # which is armed on the loop and independent of this.
+            current = getcurrent()
+            self._pre_exec_in_switch[current] = self.loop.now()
+            try:
+                return Hub.switch(self)
+            finally:
+                # Not reached by the greenlet this is all about, which is exactly
+                # how it stays in the mapping.
+                self._pre_exec_in_switch.pop(current, None)
+
+        def _pre_exec_deadline_reached(self):
+            _abort_pre_exec_child(
                 'a forked child spent %ss in the event loop before exec(); it '
                 'was almost certainly an os.register_at_fork(after_in_child=) '
                 'handler waiting for something only the parent can provide. See '
                 'gevent.subprocess._PreExecChildHub'
-                % (_PRE_EXEC_LOOP_DEADLINE,)
+                % (_PRE_EXEC_LOOP_DEADLINE,),
+                sorted(self._pre_exec_in_switch, key=self._pre_exec_in_switch.get)
             )
 
     #: The pid of the process currently between ``fork()`` and ``exec()``, or

@@ -76,6 +76,15 @@ class Test(greentest.TestCase):
         # Promptly: the point is the bound, not merely that it ends.
         self.assertLess(elapsed, 30)
 
+        # And it says which handler did it. Worth asserting rather than trusting:
+        # the greenlet reported has to be the one that never came back, and the
+        # obvious choice --- the last to switch in --- is a bystander, whatever
+        # has been keeping the loop alive. Getting that wrong still produces a
+        # plausible-looking report naming the wrong function.
+        self.assertIn('_wedge_the_child', str(exc.exception))
+        self.assertIn('_wedge_the_child',
+                      getattr(exc.exception, 'child_traceback', ''))
+
         # And nothing is left behind wearing our own cmdline, which is what a
         # child that never reached ``exec`` looks like.
         self.assertEqual(self._children_still_unexec(), [])
