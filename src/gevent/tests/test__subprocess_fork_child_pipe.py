@@ -57,8 +57,10 @@ class Test(greentest.TestCase):
 
     @greentest.skipOnWindows("Uses the POSIX fork/exec path")
     def test_spawning_does_not_consume_another_pipe(self):
+        # Not `with`: all of them have to stay open together, for the whole
+        # length of the spawn storm. They are waited on and closed below.
         victims = [
-            subprocess.Popen([sys.executable, '-c', PRODUCER],
+            subprocess.Popen([sys.executable, '-c', PRODUCER], # pylint:disable=consider-using-with
                              stdout=subprocess.PIPE)
             for _ in range(PRODUCERS)
         ]
