@@ -326,6 +326,132 @@ else:
         .. versionadded:: 26.7.1
         """
 
+    # ``__subprocess__``, not the bare name: the stdlib's exceptions are copied
+    # into this module's namespace further down, after this runs.
+    class _ForkedChildHubEntry(__subprocess__.SubprocessError):
+        """
+        Raised in the parent when a child of :meth:`Popen._execute_child` spent
+        too long in the event loop before it ``exec``'d.
+
+        A :exc:`~subprocess.SubprocessError`, because to the caller this is one:
+        a spawn that did not happen, raised from the same call and catchable by
+        whatever already handles the rest.
+
+        The child cannot survive doing that (see :class:`_PreExecChildHub`), so
+        it reports this and exits, and the parent's spawn fails with it. That is
+        a loss of one spawn. The alternative, letting the child run, was measured
+        losing the whole process: a child that never reaches ``exec`` is a second
+        interpreter holding a clone of every descriptor the parent had, and the
+        parent's spawn blocks forever waiting for an ``exec`` that never comes.
+
+        Whatever wanted the loop is almost always an
+        ``os.register_at_fork(after_in_child=)`` handler. Those run inside
+        ``fork()``, and a handler meant for a child that *continues* has no
+        business running in a child that is about to ``exec``. Register it with
+        ``after_in_parent`` as well if it needs to run at all, or guard it on the
+        pid it recorded before the fork.
+
+        .. versionadded:: 26.7.1
+        """
+
+    #: The write end of the pipe :meth:`Popen._execute_child` uses to report a
+    #: failure before ``exec``, for the spawn currently in that window, or
+    #: `None`. The child inherits it, and a child that has to die before ``exec``
+    #: needs it to say why: this is the only channel the parent is already
+    #: listening on at that point.
+    _errpipe_write_in_pre_exec_child = None
+
+    def _abort_pre_exec_child(reason):
+        """
+        Report *reason* to the parent and kill this child, which has not
+        ``exec``'d yet.
+
+        Never returns. The child is not a process that may keep running: every
+        frame in it is a copy, and it holds a clone of every descriptor the
+        parent had at the fork.
+        """
+        exc = _ForkedChildHubEntry(reason)
+        # The attribute the parent's ``_execute_child`` looks for; without it the
+        # traceback would be the parent's, which is not where this happened.
+        exc.child_traceback = ''.join(traceback.format_stack())
+        fd = _errpipe_write_in_pre_exec_child
+        if fd is not None:
+            try:
+                os.write(fd, pickle.dumps(exc))
+            except BaseException: # pylint:disable=broad-except
+                # Nothing to fall back on, and the exit below is what matters.
+                pass
+        # Not 1: that is what the ordinary pre-exec failure path uses, and these
+        # are worth telling apart in a process table or a core dump.
+        os._exit(127)
+
+    #: How long a child of :meth:`Popen._execute_child` may spend in its own
+    #: event loop before it is killed. Three orders of magnitude above what the
+    #: legitimate use needs: a fork handler that yields is back within
+    #: microseconds, and the whole window between ``fork()`` and ``exec()`` is
+    #: normally shorter than a millisecond. This is a bound on damage, not a
+    #: correctness knob; nothing should ever reach it.
+    _PRE_EXEC_LOOP_DEADLINE = 1.0
+
+    class _PreExecChildHub(Hub):
+        """
+        A fresh hub for a child that has not ``exec``'d, which that child cannot
+        settle down in.
+
+        The child of :meth:`Popen._execute_child` is given one of these instead
+        of the hub it inherited. Two things follow, and it needs both.
+
+        The parent's hub is out of reach, so nothing in the child can resume the
+        copies of greenlets it holds. That is what stops a copy writing on an
+        inherited TLS session, or reading an inherited pipe the parent was
+        capturing.
+
+        And the loop it does get is on a deadline. This part is not optional, and
+        a fresh hub that merely *works* is its own way of losing the process. A
+        working loop means nothing forces the child back out of it: a fork
+        handler that arms so much as a timer and then waits for something only
+        the parent could provide waits forever, because the loop has work to do
+        and so never raises :exc:`~gevent.exceptions.LoopExit`. ``fork()`` never
+        returns to ``_execute_child``, no ``exec`` ever happens, and the child
+        settles in as a co-tenant of the parent's descriptors. A specimen was
+        found two hours old, holding all five of an application's pooled database
+        connections and 52 TLS sockets, having burned 27 seconds of CPU on a
+        five-second timer. The parent, meanwhile, blocks in ``_execute_child``
+        reading the error pipe, which is inside ``Popen.__init__``, so a
+        ``timeout=`` on the spawn has not started counting and cannot save it.
+
+        Refusing the loop outright is the obvious answer and the wrong one. A
+        handler that yields is the ordinary case, not the pathological one:
+        ``Thread.start()`` waits on an ``Event``, a patched lock may be held by
+        another greenlet, ``logging`` takes one, and the instrumentation that
+        registers these handlers (OpenTelemetry, Sentry, ``filelock``,
+        ``coverage``) does all three. A child that died on the first yield would
+        take every spawn in such a process with it.
+
+        So the loop runs, and a timer decides how long it may. The timer is
+        deliberately unreferenced: it does not hold the loop open, so a handler
+        with nothing to wait for still gets ``LoopExit`` immediately, as before.
+        It only fires when something else is keeping the loop alive, which is
+        exactly the case that used to run for hours.
+
+        .. versionadded:: 26.7.1
+        """
+
+        def __init__(self, *args, **kwargs):
+            Hub.__init__(self, *args, **kwargs)
+            # ``ref=False``: see the class docstring. Held on the instance
+            # because a watcher nothing refers to may be collected.
+            self._pre_exec_deadline = self.loop.timer(
+                _PRE_EXEC_LOOP_DEADLINE, ref=False)
+            self._pre_exec_deadline.start(
+                _abort_pre_exec_child,
+                'a forked child spent %ss in the event loop before exec(); it '
+                'was almost certainly an os.register_at_fork(after_in_child=) '
+                'handler waiting for something only the parent can provide. See '
+                'gevent.subprocess._PreExecChildHub'
+                % (_PRE_EXEC_LOOP_DEADLINE,)
+            )
+
     #: The pid of the process currently between ``fork()`` and ``exec()``, or
     #: `None`. A forked child inherits the *parent's* pid here, which is
     #: exactly how it recognizes itself as that child. It has to be reachable
@@ -376,6 +502,7 @@ else:
         .. versionadded:: 26.7.1
         """
         global _forking_for_exec_in
+        global _errpipe_write_in_pre_exec_child
         if _in_pre_exec_child():
             raise _ForkedChildSpawn(
                 'a forked child tried to spawn before exec(); this greenlet is a '
@@ -391,8 +518,9 @@ else:
         finally:
             if pid != 0:
                 # Parent, or the fork failed. The child keeps the inherited
-                # value until exec() or os._exit() disposes of it.
+                # values until exec() or os._exit() disposes of them.
                 _forking_for_exec_in = None
+                _errpipe_write_in_pre_exec_child = None
         return pid
 
     def _detach_inherited_hub_in_pre_exec_child():
@@ -425,19 +553,20 @@ else:
         Cancelling the queued switches is not enough by itself: a copy
         parked on a timer or on an ``io`` watcher is resumed by the loop,
         not by the callback queue. Take the whole loop away instead. The
-        child gets a fresh hub, which puts the parent's watchers, its
-        queued callbacks and its hub greenlet out of reach. (That greenlet
-        is suspended inside the parent's ``loop.run()``, and would carry on
-        polling if anything ever switched to it.) A handler that yields
-        still works, on the new empty loop; one that waits for something
-        only the parent could provide now gets
-        :exc:`~gevent.exceptions.LoopExit` at once, which inside a fork
-        handler is reported as unraisable and lets the child get on with
-        ``exec``. Before, it sat there running application greenlets while
-        it waited.
+        child gets a :class:`_PreExecChildHub`, which puts the parent's
+        watchers, its queued callbacks and its hub greenlet out of reach.
+        (That greenlet is suspended inside the parent's ``loop.run()``, and
+        would carry on polling if anything ever switched to it.)
+
+        That hub also refuses to run at all, which is not a detail: see its
+        docstring for the two-hour-old child that proved a *working* fresh
+        hub is its own way of losing the process.
 
         The child is discarded microseconds later by ``exec`` or
         ``_exit``, so the hub it is given never has to be tidied up.
+
+        .. versionchanged:: 26.7.1
+           The fresh hub refuses to be entered, rather than working.
 
         .. versionadded:: 26.7.1
         """
@@ -447,11 +576,13 @@ else:
             # Nothing was ever scheduled in this thread, so there are no
             # copies to run and nothing to detach.
             return
-        # ``default=False`` matters: libev's default loop is a
+        # ``default=False`` matters twice over. libev's default loop is a
         # process-wide singleton, so a hub that asked for the default loop
-        # again would be handed the parent's loop, watchers and all.
+        # again would be handed the parent's loop, watchers and all. And a
+        # hub with a loop of its own is a hub that has never started, which
+        # is what makes its ``run`` the one door into it.
         set_loop(None)
-        set_hub(Hub(default=False))
+        set_hub(_PreExecChildHub(default=False))
 
     if hasattr(os, 'register_at_fork'):
         # Registration order is the order handlers run in the child, so
@@ -1786,6 +1917,11 @@ class Popen(object):
                     # Disable gc to avoid bug where gc -> file_dealloc ->
                     # write to stderr -> hang.  http://bugs.python.org/issue1336
                     gc.disable()
+                    # Where a child that dies before ``exec`` reports why. The
+                    # fork below clears this again in the parent, next to the pid
+                    # it keys the window on; the child keeps the inherited value.
+                    global _errpipe_write_in_pre_exec_child
+                    _errpipe_write_in_pre_exec_child = errpipe_write
                     try:
                         self.pid = fork_and_watch(self._on_child, self._loop, True,
                                                   _fork_only_outside_a_forked_child)

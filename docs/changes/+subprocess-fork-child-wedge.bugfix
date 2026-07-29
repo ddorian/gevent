@@ -1,0 +1,42 @@
+Put a deadline on the event loop of a :mod:`gevent.subprocess` child that has
+not ``exec``'d, so that it cannot stay there.
+
+The child gets a hub of its own so that it cannot resume the parent's greenlets.
+A hub that merely works, though, gives it somewhere to stay. A fork handler that
+leaves anything at all on the loop and then waits for something only the parent
+could provide waits forever: the loop has work to do, so it never raises
+:exc:`~gevent.exceptions.LoopExit`, ``fork()`` never returns to
+``_execute_child``, and no ``exec`` ever happens. The child lives on as a second
+interpreter holding a clone of every descriptor the parent had at the fork.
+
+One was found two hours after its fork, still wearing the parent's command line,
+idle in ``epoll_wait`` on a five-second timer, 27 seconds of CPU spent, holding
+all five of the application's pooled database connections and 52 TLS sockets.
+Connections the parent believed closed were still open, because the child had
+them too.
+
+The parent is no better off, and this is what leaves nothing to notice. It blocks
+reading the child's error pipe, waiting for the EOF that only ``exec`` or
+``_exit`` produces. That read is inside :meth:`Popen.__init__`, so a ``timeout=``
+on the spawn has not started counting and cannot end it.
+
+Refusing the loop outright would be the obvious answer and is the wrong one. A
+fork handler that yields is the ordinary case, not the pathological one:
+``Thread.start()`` waits on an ``Event``, a patched lock may be held by another
+greenlet, ``logging`` takes one, and the instrumentation that registers these
+handlers (OpenTelemetry, Sentry, ``filelock``, ``coverage``) does all three. A
+child that died on its first yield would take every spawn in such a process with
+it.
+
+So the loop runs, and a timer decides for how long. One second, against a window
+that is normally shorter than a millisecond and a yield that costs microseconds.
+The timer is unreferenced, so it does not hold the loop open: a handler with
+nothing to wait for still gets ``LoopExit`` at once, as before, and the timer
+fires only when something else is keeping the loop alive. That is precisely the
+case that used to run for hours. The child then reports itself down the error
+pipe and exits, and the spawn raises
+:exc:`~subprocess.SubprocessError` in the parent instead of hanging.
+
+A failed spawn is the cost. It is worth paying: the alternative was measured
+costing the whole process, and a spawn that raises can be retried by an
+application that can no longer be starved by one that never returns.
