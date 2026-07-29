@@ -1,0 +1,27 @@
+Stop a forked child from resuming greenlets that were blocked at the fork.
+
+The companion to cancelling the queued switches. That queue only holds greenlets
+that were *runnable*; one that was blocked is parked on a watcher, and the loop
+resumes it from there without consulting the queue. Both are copies in the
+child, and neither may run: on an inherited TLS session such a copy writes a
+record the parent will write again under the same sequence number, drawing
+``bad_record_mac`` from the server, and on an inherited pipe it consumes bytes
+the parent was capturing.
+
+A watcher that is active at fork time is active precisely because something is
+parked on it, and gevent's watchers are created once per object and started and
+stopped around each wait, so stopping one in the child cancels the pending
+resume without damaging the object. The child's next wait on that socket or file
+starts it again, which is what lets a child of a plain ``os.fork()`` carry on
+using what it inherited, as :mod:`gevent.os` documents and as gevent's own
+bind/fork/accept server pattern requires.
+
+Only waits are cancelled, and only other greenlets' waits. A watcher whose
+callback is a ``Waiter.switch`` is one a greenlet is blocked on; anything else is
+left alone, including signal handlers, which a child inherits by ordinary POSIX
+rules, and :class:`gevent.Timeout`, whose timer may belong to a ``with`` block
+the forking greenlet is still inside.
+
+Finding those watchers costs one ``gc.get_objects()`` walk per fork in the
+child, which measured about 2ms against a 690,000 object heap, against 70ms for
+the spawn it accompanies.

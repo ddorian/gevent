@@ -24,6 +24,7 @@ Implementation of the standard :mod:`threading` using greenlets.
 """
 
 
+import gc
 import os
 import sys
 
@@ -476,6 +477,74 @@ class _ForkHooks:
         for cb in list(queue):
             cb.stop()
 
+    @staticmethod
+    def _watcher_types():
+        # The base class of the loop's watchers, which differs per backend and
+        # is not reachable from the loop object. Ask whichever backend modules
+        # are imported; importing one that is not in use would be wrong as
+        # well as wasteful.
+        types = []
+        for name in ('gevent.libev.corecext', 'gevent.libev.watcher',
+                     'gevent.libuv.watcher', 'gevent._ffi.watcher'):
+            mod = sys.modules.get(name)
+            base = getattr(mod, 'watcher', None)
+            if isinstance(base, type):
+                types.append(base)
+        return tuple(types)
+
+    @classmethod
+    def _cancel_pending_waits_in_child(cls):
+        # The queue above only holds greenlets that were *runnable*. One that
+        # was blocked is parked on a watcher instead, and the loop resumes it
+        # from there without consulting the queue. In the child that greenlet
+        # is a copy, and resuming it hands the application's work to a process
+        # that was never meant to do any of it: on an inherited TLS session it
+        # writes a record the parent will then write again under the same
+        # sequence number, and on an inherited pipe it consumes bytes the
+        # parent was capturing.
+        #
+        # A watcher that is active at fork time is active precisely because
+        # something is parked on it, and gevent's watchers are created once per
+        # object and started and stopped around each wait. Stopping one here
+        # therefore cancels the pending resume without damaging the object: the
+        # child's next wait on that socket or file starts it again. That is what
+        # makes this safe for a child that carries on using what it inherited,
+        # which a child of a plain ``os.fork()`` is entitled to do.
+        #
+        # Only waits are cancelled, and only other greenlets' waits. A watcher
+        # whose callback is a ``Waiter.switch`` is one a greenlet is blocked on;
+        # anything else belongs to the application and keeps working, notably
+        # signal handlers (which a child inherits by ordinary POSIX rules) and
+        # ``Timeout``, whose timer may belong to a ``with`` block the forking
+        # greenlet is still inside.
+        watcher_types = cls._watcher_types()
+        if not watcher_types:
+            return
+        # Local import: gevent.hub imports us, so this cannot be at module
+        # scope.
+        from gevent.hub import Waiter
+        current = getcurrent()
+        for obj in gc.get_objects():
+            if not isinstance(obj, watcher_types):
+                continue
+            try:
+                # ``active`` is not enough. A watcher that has already fired is
+                # inactive but still *pending*: the loop has collected its event
+                # and has yet to invoke the callback, which it will do in the
+                # child. That is the common case for a greenlet parked in a
+                # short ``sleep``. Stopping a watcher clears its pending event
+                # as well as deactivating it.
+                if not obj.active and not obj.pending:
+                    continue
+                waiter = getattr(obj.callback, '__self__', None)
+            except AttributeError: # pragma: no cover
+                continue
+            if not isinstance(waiter, Waiter):
+                continue
+            if waiter.greenlet is None or waiter.greenlet is current:
+                continue
+            obj.stop()
+
     def after_fork_in_child(self):
         # We've already imported threading, which installed its "after" hook,
         # so we're going to be called after that hook.
@@ -487,6 +556,7 @@ class _ForkHooks:
 
         self._stop_running_greenlets_in_child()
         self._cancel_pending_switches_in_child()
+        self._cancel_pending_waits_in_child()
 
         main = __threading__._MainThread()
         main._ident = get_ident() # 3.13: reset to the greenlet version.
