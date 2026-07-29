@@ -7,25 +7,18 @@
     $ uv run --script gevent_raw_fork_poisoning_repro.py
     POISONED: SSLError('[SSL: SSLV3_ALERT_BAD_RECORD_MAC] sslv3 alert bad record mac')
 
-The sibling of gevent_fork_ssl_poisoning_repro.py with the spawn removed. The
-child here does nothing whatsoever: it calls os._exit(0) the instant fork()
-returns. Every byte it put on the wire was written by a copy of the parent's
-greenlet, inside fork(), before it returned to anyone.
-
-os.register_at_fork(after_in_child=) handlers run inside fork(), before it has
-returned to its caller, and under monkey-patching they yield. OpenTelemetry,
-Sentry and filelock all register one. The yield reaches the forked child's copy
-of the hub, which resumes copies of the parent's greenlets. A resumed copy
-writes a record under the sequence number its copy of the session state says is
-next; the parent reuses that number; the server's MAC check fails and it answers
+The child does nothing but os._exit(0), so every byte it put on the wire came
+from a copy of the parent's greenlet, running inside fork(). An at-fork child
+handler that yields (OpenTelemetry, Sentry and filelock each register one) hands
+control to the child's copy of the hub, which resumes that copy; it writes a TLS
+record under the sequence number the parent then reuses, and the server answers
 bad_record_mac.
 
-Giving the gevent.subprocess child a hub of its own does not help here, because
-this child is not a subprocess child. It keeps the hub it inherited, on purpose:
-a child of a plain fork may legitimately keep using the gevent objects it
-inherited, which is what gevent's own bind/fork/accept server pattern does.
+gevent_fork_ssl_poisoning_repro.py is this with the fork replaced by a spawn.
+That child gets a hub of its own; this one keeps the hub it inherited, because a
+child of a plain fork may legitimately keep using inherited gevent objects.
 
-Delete the register_at_fork line below for the control run, which passes.
+Delete the register_at_fork line for the control run, which passes.
 """
 from gevent import monkey; monkey.patch_all()   # first, before anything it patches
 
@@ -41,14 +34,14 @@ if sys.argv[1:2] == ['--server']:       # this file re-executed as the TLS peer,
     srv.listen(1)
     print(srv.getsockname()[1], flush=True)
     conn = ctx.wrap_socket(srv.accept()[0], server_side=True)
-    while True:
-        try:
+    try:
+        while True:
             data = conn.recv(4096)
-        except OSError:                 # the MAC failure; the alert is already sent
-            break
-        if not data:
-            break
-        conn.sendall(data)
+            if not data:
+                break
+            conn.sendall(data)
+    except OSError:                     # the MAC failure; the alert is already sent
+        pass
     sys.exit()
 
 
@@ -91,14 +84,11 @@ for _ in range(20):
     pid = os.fork()
     if pid == 0:
         os._exit(0)     # do nothing whatsoever, and leave
-    os.waitpid(pid, 0)
+    os.waitpid(pid, 0)  # not os.wait(), which would reap the server too
     gevent.sleep(0.01)
-    if talker.dead:
-        break
 
 server.kill()
 if talker.dead:
     print('POISONED: %r' % (talker.exception,))
     sys.exit(1)
-talker.kill()
 print('TLS connection intact')
