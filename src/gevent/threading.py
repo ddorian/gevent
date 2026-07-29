@@ -67,7 +67,6 @@ from gevent.thread import _make_thread_handle
 from gevent.thread import allocate_lock as _allocate_lock
 from gevent.thread import get_ident as _get_ident
 from gevent.hub import sleep as _sleep, getcurrent
-from gevent.hub import _get_hub as _get_hub_if_exists
 from gevent.lock import RLock
 
 
@@ -435,33 +434,6 @@ class _ForkHooks:
                 # over what gets to run.
                 handle._set_done(enter_hub=False)
 
-    @staticmethod
-    def _drop_scheduled_greenlets_in_child():
-        # Making them *appear* stopped is not enough. Anything sitting on the
-        # loop's callback queue is a pending switch into a greenlet, and in the
-        # child every one of those greenlets is a copy. Leave them queued and
-        # the child's hub resumes them the moment anything yields --- and the
-        # first thing that can yield is the next
-        # ``os.register_at_fork(after_in_child=)`` handler, running before
-        # ``fork()`` has even returned to whoever called it. Under
-        # monkey-patching those handlers yield readily (``Thread.start()``
-        # waits on an ``Event``, a patched lock may be held, ``logging`` takes
-        # one), and the copies then redo the application's work in a process
-        # that was never meant to do any of it.
-        #
-        # Nothing in that queue can belong to the greenlet that forked: that
-        # one is running, not waiting to be switched to.
-        hub = _get_hub_if_exists()
-        loop = getattr(hub, 'loop', None)
-        queue = getattr(loop, '_callbacks', None)
-        if queue is not None:
-            # Replace rather than clear. The C loop's queue is a cdef class
-            # whose ``clear`` is not exposed to Python, so calling it raises
-            # ``AttributeError`` --- and inside a fork handler that becomes an
-            # unraisable, i.e. a silent no-op. Constructing a new empty one of
-            # the same type works for that and for the CFFI loop's ``deque``.
-            loop._callbacks = type(queue)()
-
 
     def after_fork_in_child(self):
         # We've already imported threading, which installed its "after" hook,
@@ -473,7 +445,6 @@ class _ForkHooks:
         assert get_ident() == self._before_fork_ident
 
         self._stop_running_greenlets_in_child()
-        self._drop_scheduled_greenlets_in_child()
 
         main = __threading__._MainThread()
         main._ident = get_ident() # 3.13: reset to the greenlet version.
