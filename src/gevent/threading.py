@@ -558,10 +558,18 @@ class _ForkHooks:
                 # ``epoll_ctl`` on a descriptor the child inherited rather than
                 # on memory it copied. That is the parent's own epoll set, and
                 # the parent goes on to wait forever for a socket it will never
-                # hear about again. (libev batches the same call until its next
-                # loop iteration, which a child that ``exec``s never reaches, and
-                # ``reinit`` gives a child that keeps running an epoll set of its
-                # own. libuv's ``reinit`` cannot; see the comment on it.)
+                # hear about again. Measured, with ``strace``: 88 successful
+                # deletions of the parent's pipes from it in one run, and the
+                # parent left in ``ep_poll``.
+                #
+                # libev is not exposed to this, because it batches the same call
+                # until its next loop iteration. A child that ``exec``s never
+                # reaches one, and a child that keeps running calls
+                # ``gevent.hub.reinit`` first, which hands it a backend of its
+                # own. (So does libuv's, through ``uv_loop_fork``. It does not
+                # help here: the fork/exec path deliberately forks with the
+                # *raw* ``os.fork``, so no ``reinit`` runs on it at all, and on
+                # the paths where one does it runs after these handlers.)
                 #
                 # Stopping short leaves nothing dangling. The registration is
                 # shared with the other waits on that descriptor, the child's own

@@ -17,6 +17,9 @@ Run it under both backends. What the child may do to reach that state differs:
 libuv registers a given fd with its epoll set once and shares that registration
 between every wait on it, so there a wait has to be cancelled without stopping
 the watcher at all.
+
+Not, however, under libuv on macOS, where forking and carrying on is not
+something the backend can do at all. See the skip below.
 """
 from gevent import monkey; monkey.patch_all() # pragma: testrunner-no-monkey-combine
 
@@ -78,6 +81,14 @@ def _hammer(port, deadline, start, step, ok, bad):
         i += step
 
 
+@greentest.skipIf(
+    greentest.LIBUV and greentest.OSX,
+    "libuv cannot fork and continue on macOS. Its backend there is kqueue, whose "
+    "descriptors are not inherited, so a child that runs the inherited loop dies "
+    "on the next backend call; gevent's own libuv loop.reinit says as much, and "
+    "the child aborts inside uv_async_send with SIGABRT rather than failing an "
+    "assertion. Nothing this test is about can be observed there."
+)
 class Test(greentest.TestCase):
 
     __timeout__ = 60

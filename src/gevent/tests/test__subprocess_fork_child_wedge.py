@@ -54,6 +54,12 @@ if hasattr(os, 'register_at_fork'):
 
 
 @greentest.skipOnWindows("Uses the POSIX fork/exec path")
+@greentest.skipIf(
+    not hasattr(os, 'register_at_fork') or not os.path.isdir('/proc/self'),
+    "Needs register_at_fork to wedge the child, and a Linux-style /proc to prove "
+    "afterwards that none is left. The deadline itself is not platform-specific, "
+    "but this way of observing it is."
+)
 class Test(greentest.TestCase):
 
     # The deadline itself, plus room for the spawn around it.
@@ -102,11 +108,6 @@ class Test(greentest.TestCase):
                 return []
             time.sleep(0.05)
         return found
-
-
-if not hasattr(os, 'register_at_fork') or not os.path.isdir('/proc/self'):
-    # The handler cannot be installed, or the census cannot be taken.
-    del Test
 
 
 if __name__ == '__main__':

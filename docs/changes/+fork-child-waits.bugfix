@@ -30,9 +30,19 @@ serves every wait on a given descriptor, and it lives in a descriptor the child
 inherited rather than in memory it copied, so a child that deregistered its own
 wait would silence the parent's socket too, and the parent would wait forever for
 a connection it never hears about. There the callback alone is cleared, which is
-what the loop checks before dispatching. (libev batches the same call until its
-next loop iteration, which a child that ``exec``s never reaches, and ``reinit``
-gives a child that keeps running an ``epoll`` set of its own.)
+what the loop checks before dispatching.
+
+libev is not exposed to this, because it batches the same call until its next loop
+iteration: a child that ``exec``s never reaches one, and a child that keeps
+running calls :func:`gevent.hub.reinit` first, which hands it a backend of its
+own. So does libuv's ``reinit``, but not in time to matter here, since the
+fork/exec path forks with the raw :func:`os.fork` and runs no ``reinit`` at all.
+
+Forking and carrying on is not available under libuv on macOS in any case. The
+backend there is kqueue, whose descriptors are not inherited, so a child that
+runs the inherited loop aborts on its next backend call. gevent's libuv
+``loop.reinit`` has said so for years, and the regression test for the inherited
+listener skips there.
 
 Finding those watchers costs one ``gc.get_objects()`` walk per fork in the
 child, which measured about 2ms against a 690,000 object heap, against 70ms for
