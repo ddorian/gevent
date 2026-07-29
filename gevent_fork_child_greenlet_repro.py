@@ -45,13 +45,32 @@ MEASURED (CPython 3.14.6, gevent 26.7.1.dev0)
     default          -> 80 lines from 20 child pids, out of 20 forks
     YIELD=0          -> 0 lines, 0 pids
 
-NOT FIXED
+NOT FIXED, AND WHY
 
-An attempt that did not work, recorded so it is not repeated: dropping the loop's
-pending callbacks (``hub.loop._callbacks.clear()``, present on both backends) from
-``_ForkHooks.after_fork_in_child``, which runs first among the child's handlers. The
-hook runs and the queue is cleared --- verified --- and the copies still run. Whatever
-resumes them is some other path.
+Two attempts, both in ``_ForkHooks.after_fork_in_child`` (which runs first among the
+child's handlers, so it can act before a third-party one yields):
+
+1. ``hub.loop._callbacks.clear()``. Does nothing at all. ``clear`` on the C loop's
+   ``CallbackFIFO`` is a ``cdef`` method, invisible to Python, so the call raises
+   ``AttributeError`` -- and an exception inside a fork handler is reported as
+   unraisable, i.e. swallowed. A fix that cannot run looks exactly like a fix that
+   does not work; only instrumenting the hook told them apart.
+
+2. ``loop._callbacks = type(queue)()`` -- replace rather than clear, which works on
+   both backends. This *does* stop the copies: 80 lines becomes 0. But it breaks
+   ``test__threading_2.ThreadJoinOnShutdown.test_3_join_in_forked_from_thread``,
+   which forks from a greenlet and then uses ``threading`` in the child. That child
+   needs greenlets which were merely runnable at the moment of the fork, and
+   discarding the queue strands them; the test hangs until its 60s timeout.
+
+So the queue cannot simply be dropped: a forked child that keeps using gevent is
+supported, and gevent's own suite encodes it. Telling "a copy that must not run" apart
+from "the child's own continued use of gevent" is the real problem, and it is the
+semantics change ``gevent/os.py`` defers to a major release.
+
+What *is* fixed is the sharp consequence, in gevent.subprocess: see
+``gevent_fork_child_switch_repro.py``. A child between fork() and exec() may not fork,
+so the copies can no longer exec onto that spawn's pipes.
 """
 
 from gevent import monkey; monkey.patch_all()
