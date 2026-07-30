@@ -17,12 +17,20 @@ from gevent import monkey; monkey.patch_all() # pragma: testrunner-no-monkey-com
 import os
 import subprocess
 import sys
+import threading
+import time
+
+import gevent
 
 from gevent import subprocess as gevent_subprocess
 
 from gevent import testing as greentest
 
 READER, WRITER = (os.pipe() if hasattr(os, 'register_at_fork') else (-1, -1))
+
+#: Stands in for the ones the registrants in the census really take: a
+#: ``logging`` lock, a ``filelock``, the one inside a ``ThreadPoolExecutor``.
+LOCK = threading.Lock()
 
 
 def _mark(): # pragma: no cover
@@ -33,11 +41,19 @@ def _mark(): # pragma: no cover
         pass
 
 
+def _wants_the_lock(): # pragma: no cover
+    # The shape that lost the spawns: a handler that waits for something only
+    # a greenlet could hand over, in a process where no greenlet may run.
+    with LOCK:
+        pass
+
+
 if hasattr(os, 'register_at_fork'):
     # Registered *after* gevent.subprocess was imported, which is what makes it
     # ours to guard. gevent's own handler is registered before the guard is
     # installed and so keeps running in the pre-exec child, where it must.
     os.register_at_fork(after_in_child=_mark)
+    os.register_at_fork(after_in_child=_wants_the_lock)
 
 
 @greentest.skipIf(not hasattr(os, 'register_at_fork'),
@@ -76,6 +92,64 @@ class Test(greentest.TestCase):
             os._exit(0)
         greentest.wait_for_child(pid, timeout=20)
         self.assertEqual(self._drain(), b'x')
+
+    @greentest.skipOnWindows("Uses the POSIX fork/exec path")
+    def test_spawn_survives_a_handler_that_wants_a_held_lock(self):
+        # The reported failure, reduced: the handler waits for a lock a
+        # greenlet holds across the spawn, and only that greenlet can give it
+        # up. Scenario coverage rather than a tripwire --- what it does without
+        # the guard depends on whether the child's loop has anything else to
+        # do, and with nothing to do the wait ends in a LoopExit that CPython
+        # prints and ignores rather than in a lost spawn.
+        # ``test_handler_is_skipped_before_exec`` is the deterministic one.
+        holder = gevent.spawn(self._hold_lock_for, 3)
+        try:
+            gevent.sleep(0.05)
+            self.assertTrue(LOCK.locked())
+            started = time.time()
+            subprocess.run([sys.executable, '-c', 'pass'], check=True)
+            # Promptly: not merely 'did not hang', but 'did not sit out the
+            # pre-exec deadline either'.
+            self.assertLess(time.time() - started, 10)
+        finally:
+            holder.kill(block=True)
+
+    @greentest.skipOnWindows("Uses the POSIX fork/exec path")
+    def test_concurrent_spawns_survive_a_cycling_lock(self):
+        # Concurrency is what turned this from possible into certain: each fork
+        # lands while another spawn's handlers are mid-critical-section. The
+        # application that hit it ran two spawns at once and lost both, every
+        # time, while its serial forks stayed clean.
+        stop = []
+        cycler = gevent.spawn(self._cycle_lock, stop)
+        try:
+            gevent.sleep(0.02)
+            spawns = [
+                gevent.spawn(subprocess.run, [sys.executable, '-c', 'pass'])
+                for _ in range(self.CONCURRENT)
+            ]
+            gevent.joinall(spawns, timeout=60)
+            for g in spawns:
+                self.assertIsNone(g.exception)
+                self.assertIsNotNone(g.value, "spawn did not finish")
+                self.assertEqual(g.value.returncode, 0)
+        finally:
+            stop.append(1)
+            cycler.kill(block=True)
+
+    CONCURRENT = 4
+
+    @staticmethod
+    def _hold_lock_for(seconds): # pragma: no cover
+        with LOCK:
+            gevent.sleep(seconds)
+
+    @staticmethod
+    def _cycle_lock(stop): # pragma: no cover
+        while not stop:
+            with LOCK:
+                gevent.sleep(0.001)
+            gevent.sleep(0)
 
     @greentest.skipOnWindows("Uses the POSIX fork/exec path")
     def test_guard_can_be_turned_off(self):
