@@ -56,6 +56,19 @@ if hasattr(os, 'register_at_fork'):
     os.register_at_fork(after_in_child=_wants_the_lock)
 
 
+class TestPredicate(greentest.TestCase):
+    # Deliberately outside the class below, which skips wherever
+    # ``os.register_at_fork`` is missing. That is Windows, which is the only
+    # platform where the Windows implementation of this exists, so a skip there
+    # would leave it the one part of this never run anywhere.
+
+    __timeout__ = 60
+
+    def test_is_false_outside_the_window(self):
+        # A question anyone may ask at any time, on any platform.
+        self.assertFalse(gevent_subprocess.in_pre_exec_child())
+
+
 @greentest.skipIf(not hasattr(os, 'register_at_fork'),
                   "Needs os.register_at_fork")
 class Test(greentest.TestCase):
@@ -70,11 +83,6 @@ class Test(greentest.TestCase):
             return b''
         finally:
             os.set_blocking(READER, True)
-
-    def test_predicate_is_false_outside_the_window(self):
-        # It is a question anyone may ask at any time, including on Windows,
-        # where the answer is always no.
-        self.assertFalse(gevent_subprocess.in_pre_exec_child())
 
     @greentest.skipOnWindows("Uses the POSIX fork/exec path")
     def test_handler_is_skipped_before_exec(self):
