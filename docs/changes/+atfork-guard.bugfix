@@ -1,0 +1,42 @@
+Do not run ``os.register_at_fork(after_in_child=)`` handlers in a child that is
+about to ``exec``.
+
+Such a handler is written for a child that *continues*. OpenTelemetry rebuilds
+a ``ThreadPoolExecutor`` and takes fresh locks, Sentry resets its worker
+threads, ``filelock`` reinitialises its locks. gevent's POSIX spawn forks and
+``exec``s in Python, so all of them run in that child as well, before ``fork()``
+has returned to the code that will ``exec``. CPython's own ``subprocess`` never
+shows this, because its C ``fork_exec`` runs no Python at-fork hooks.
+
+Nothing such a handler rebuilds can outlive the ``exec`` that is microseconds
+away, so running them there buys nothing. It can cost the spawn. The child is a
+copy of a whole process worth of greenlets, and only the one that forked may
+run, so a handler that takes a monkey-patched lock another greenlet held at the
+fork instant waits in a process that has no way to release it. Where the loop
+has nothing else to do that ends quickly, in a ``LoopExit`` that is printed and
+ignored; where it does, the child reaches its deadline instead and the spawn
+fails. Concurrency decides which: measured on an application that runs two
+spawns at once, 9 of 9 concurrent spawns were lost against 46 of 46 serial
+forks clean.
+
+So :mod:`gevent.subprocess` now wraps :func:`os.register_at_fork`, and an
+``after_in_child`` handler registered through it returns immediately in that
+child. The ordering this depends on is the ordering that was already there:
+gevent registers its own handler before installing the wrapper, so that one
+still runs, and an application cannot register before gevent because importing
+:mod:`gevent.subprocess` is part of ``monkey.patch_all()``.
+
+Deliberately narrow. ``before`` and ``after_in_parent`` run in a process that
+carries on and are untouched, and so is ``after_in_child`` for a child of a
+plain :func:`os.fork`, which is a child that continues and needs every one of
+them. Handlers registered before :mod:`gevent.subprocess` was imported --- a
+``coverage`` started from a site hook, say --- are out of reach and still run.
+
+Three ways out for anyone this is wrong for. Set
+:attr:`gevent.config.atfork_guard` (``GEVENT_ATFORK_GUARD``) to false and every
+handler is registered unwrapped. Register through
+``gevent.monkey.get_original('os', 'register_at_fork')``, which still reaches
+the real function, for one handler rather than all of them. Or ask
+:func:`gevent.subprocess.in_pre_exec_child`, which is now public, and which a
+handler can use to guard itself: it answers false everywhere except that
+window, including on Windows, where there is no such window at all.

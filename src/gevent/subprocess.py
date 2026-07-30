@@ -72,6 +72,7 @@ from gevent._compat import MAC
 from gevent._compat import fsdecode
 from gevent._compat import fsencode
 from gevent._compat import PathLike
+from gevent._config import config
 from gevent._util import _NONE
 from gevent._util import copy_globals
 
@@ -296,6 +297,18 @@ if mswindows:
 
         __del__ = Close
         __str__ = __repr__
+
+    def in_pre_exec_child():
+        """
+        Always false here: Windows has no ``fork``, so there is no window
+        between it and ``exec`` to be inside of.
+
+        Provided so that a caller can ask without first asking what platform
+        it is on.
+
+        .. versionadded:: 26.7.1
+        """
+        return False
 else:
     import fcntl
     import pickle
@@ -540,13 +553,34 @@ else:
     #: runnable in the child is a different greenlet entirely.
     _forking_for_exec_in = None
 
-    def _in_pre_exec_child():
+    def in_pre_exec_child():
         """
-        Are we a child of :meth:`Popen._execute_child` that has not
+        Is this process a child of :meth:`Popen._execute_child` that has not
         ``exec``'d yet?
+
+        True only inside the window between gevent's ``fork()`` and the
+        ``exec`` that follows it, and only in the child. Everywhere else,
+        including the parent's own window and a child of a plain
+        :func:`os.fork`, this is false.
+
+        Almost nothing may safely be done in that child: it is a copy of a
+        whole process worth of greenlets, and it is about to be replaced.
+        Code that runs there whether it likes it or not --- an
+        ``os.register_at_fork(after_in_child=)`` handler, most of all --- can
+        ask this and return.
+
+        gevent asks it on your behalf for handlers registered after
+        :mod:`gevent.subprocess` was imported; see
+        :attr:`gevent.config.atfork_guard`. This is for the handlers it cannot
+        reach, and for libraries that would rather guard themselves.
+
+        .. versionadded:: 26.7.1
         """
         return (_forking_for_exec_in is not None
                 and _forking_for_exec_in != os.getpid())
+
+    #: The name the rest of this module was written against.
+    _in_pre_exec_child = in_pre_exec_child
 
     def _fork_only_outside_a_forked_child():
         """
@@ -671,7 +705,89 @@ else:
         # it is, because importing this module is part of
         # ``monkey.patch_all()``, and gevent must be patched before the
         # application imports anything that registers its own.
-        os.register_at_fork(after_in_child=_detach_inherited_hub_in_pre_exec_child)
+        #
+        # That same ordering is what lets us guard the application's handlers
+        # below: ours goes on through the original function, so it keeps
+        # running in the pre-exec child, where it is the one thing that must.
+        _register_at_fork = os.register_at_fork
+        _register_at_fork(after_in_child=_detach_inherited_hub_in_pre_exec_child)
+
+        def _skipped_in_pre_exec_child(handler):
+            # Thin on purpose, and it returns *before* calling the handler in
+            # the child this is about, so it never appears in the diagnostic
+            # that names a handler for wedging one.
+            def after_in_child():
+                if in_pre_exec_child():
+                    return None
+                return handler()
+            after_in_child.__wrapped__ = handler
+            return after_in_child
+
+        def register_at_fork(*, before=_NONE, after_in_child=_NONE,
+                             after_in_parent=_NONE):
+            """
+            :func:`os.register_at_fork`, with ``after_in_child`` skipped in a
+            child that is about to ``exec``.
+
+            Such a handler is written for a child that continues, and this one
+            does not: it is replaced microseconds later, so nothing the handler
+            reinitialises can outlive it. Meanwhile the handler runs in a
+            process where most of the greenlets it might wait on are copies
+            that will never run again, so one that takes a monkey-patched lock
+            another greenlet held at the fork blocks in a process that cannot
+            unblock it, and the spawn is lost. Measured on an application that
+            forks two children at once: 9 of 9 concurrent spawns lost, against
+            46 of 46 serial forks clean.
+
+            ``before`` and ``after_in_parent`` run in a process that carries
+            on, and are passed through untouched. So is ``after_in_child`` for
+            a child of a plain :func:`os.fork`, which is a child that
+            continues and needs every one of them.
+
+            Set :attr:`gevent.config.atfork_guard` to false to register
+            handlers unwrapped.
+
+            .. versionadded:: 26.7.1
+            """
+            if after_in_child is not _NONE and callable(after_in_child):
+                after_in_child = _skipped_in_pre_exec_child(after_in_child)
+            # Forward only what was actually passed, and forward it verbatim:
+            # an explicit ``None`` is a TypeError to the real function rather
+            # than an omission, and so is passing nothing at all. Both are its
+            # errors to raise, in its own words.
+            kwargs = {
+                k: v
+                for k, v in (('before', before),
+                             ('after_in_child', after_in_child),
+                             ('after_in_parent', after_in_parent))
+                if v is not _NONE
+            }
+            return _register_at_fork(**kwargs)
+
+        if config.atfork_guard:
+            # Deliberately on ``os`` itself, not only on the patched copy:
+            # the registrants this is for (OpenTelemetry, Sentry, filelock)
+            # call ``os.register_at_fork`` directly.
+            #
+            # Record it where the rest of gevent's replacements are recorded,
+            # or ``monkey.get_original('os', 'register_at_fork')`` would hand
+            # back this wrapper --- a patched object from the function whose
+            # entire job is to return the unpatched one. Imported here rather
+            # than at module scope: ``gevent.monkey`` reaches this module, and
+            # only this branch needs it.
+            from gevent.monkey import saved as _saved
+            _saved.setdefault('os', {}).setdefault(
+                'register_at_fork', os.register_at_fork)
+            os.register_at_fork = register_at_fork
+
+            # :mod:`gevent.os` re-exports this one rather than implementing it,
+            # and says so in its ``__imports__``, which is a promise that what
+            # it exports *is* what :mod:`os` exports. Leaving it holding the
+            # function we just replaced would make that false, and
+            # :mod:`gevent.tests.test__all__` checks it.
+            import gevent.os as _gevent_os
+            if getattr(_gevent_os, 'register_at_fork', None) is _register_at_fork:
+                _gevent_os.register_at_fork = register_at_fork
 
 # Some explicit imports for static analysis
 STDOUT = __subprocess__.STDOUT

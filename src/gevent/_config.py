@@ -520,6 +520,33 @@ class MonitorThread(BoolSettingMixin, Setting):
     .. versionadded:: 1.3b1
     """
 
+class AtForkGuard(BoolSettingMixin, Setting):
+    name = 'atfork_guard'
+    environment_key = 'GEVENT_ATFORK_GUARD'
+    default = True
+
+    desc = """\
+    Should ``os.register_at_fork(after_in_child=)`` handlers be skipped in a
+    child that is about to ``exec``?
+
+    :mod:`gevent.subprocess` forks and ``exec``s in Python, so those handlers
+    run in that child, before ``fork()`` has returned to the code that will
+    ``exec``. They are written for a child that *continues* --- reinitialising
+    locks, rebuilding thread pools --- and under monkey-patching one of them
+    can block on a lock whose holder is a greenlet copy that will never run
+    again, losing the spawn. Nothing they would rebuild survives the ``exec``,
+    so by default gevent does not run them there.
+
+    Handlers registered before :mod:`gevent.subprocess` was imported are not
+    affected, and neither is a child of a plain :func:`os.fork`, which still
+    runs every handler.
+
+    Set this to false if an application really does need ``after_in_child`` to
+    run in an ``exec``-bound child.
+
+    .. versionadded:: 26.7.1
+    """
+
 class MaxBlockingTime(FloatSettingMixin, Setting):
     name = 'max_blocking_time'
     # This environment key doesn't follow the convention because it's

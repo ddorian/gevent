@@ -50,7 +50,16 @@ def _wedge_the_child(): # pragma: no cover
 
 
 if hasattr(os, 'register_at_fork'):
-    os.register_at_fork(after_in_child=_wedge_the_child)
+    # Through the *raw* function, deliberately. gevent skips handlers
+    # registered through the patched one in this child
+    # (:mod:`gevent.tests.test__subprocess_atfork_guard`), which is the real
+    # fix for this and would stop the wedge from ever happening. The deadline
+    # tested here is the backstop for the handlers that guard cannot reach:
+    # ones registered before :mod:`gevent.subprocess` was imported, such as a
+    # ``coverage`` started from a site hook. Registering the ordinary way would
+    # leave that backstop untested.
+    monkey.get_original('os', 'register_at_fork')(
+        after_in_child=_wedge_the_child)
 
 
 @greentest.skipOnWindows("Uses the POSIX fork/exec path")
