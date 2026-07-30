@@ -7,6 +7,46 @@ try). This file is the gevent-side half: move the same guard into
 lets the app-side copy be deleted. Written for the `ddorian/gevent`
 `all-fixes-not-upstream` branch; self-contained.
 
+## gevent-side status, 2026-07-30
+
+Items 1, 2 and 4 are done, on `all-fixes-not-upstream`: `09d08119` (the guard,
+`gevent.config.atfork_guard`/`GEVENT_ATFORK_GUARD`, public
+`gevent.subprocess.in_pre_exec_child()` with a Windows counterpart, changenote,
+end-to-end pipe-marker test) and `046906f5` (the held-lock reproducer and the
+concurrent-pair stress). The app-side `gevent_patch.py` can drop its pin on
+`_forking_for_exec_in` and use `in_pre_exec_child()`, or be deleted outright
+once running a gevent with `09d08119`.
+
+**Item 3 (retry the fork once) was considered and skipped**, deliberately. The
+retry has to go inside `_execute_child`, where two things make it invasive: the
+parent closes the child-end fds before it reads the errpipe, so a second fork
+needs those closes deferred past the retry decision; and the dead first child
+has already been through `fork_and_watch`, so `_on_child` has set `returncode`
+and completed `result` by then, and a retry that does not reset both leaves
+`poll()` reporting 127 for a process that is running. That is ~30 lines of
+surgery in the spawn path every POSIX gevent user runs, to cover a case this
+file already describes as one that should never fire once handlers are guarded.
+Revisit only if a handler registered *before* `gevent.subprocess` was imported
+(a `coverage` started from a site hook is the realistic one) is ever seen
+wedging a child in practice; until then the 1s deadline fails such a spawn
+cleanly rather than hanging, which is the behaviour that matters.
+
+Two corrections to this file's own text, both measured on `d1b08752`:
+
+- The deterministic reproducer under "Deterministic reproducer" does **not**
+  fail on this rev. `subprocess.run` succeeds in ~0.01s. The handler's wait on
+  the contended lock reaches a hub whose loop has nothing to do, so it ends in
+  a `LoopExit` that CPython prints as "Exception ignored in:" and then ignores,
+  and the child goes on to `exec`. Reaching `_ForkedChildHubEntry` needs the
+  child's loop to have referenced work, which the application had and a reduced
+  case does not. The regression test that *is* deterministic is the pipe
+  marker: a handler either writes its byte or it does not.
+- Consequently the "Validation bar" as stated cannot be met by that reproducer
+  on this rev, and was not used. What was verified instead: the pipe-marker
+  contract both ways, and the full 3.14 suite run with the guard on and off,
+  same failing set, the only difference being the guard's own test, which must
+  fail when the guard is off.
+
 ## The defect, one paragraph
 
 `os.register_at_fork(after_in_child=)` handlers run inside `fork()`, in the
