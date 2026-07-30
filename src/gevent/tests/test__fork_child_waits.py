@@ -55,7 +55,8 @@ class Test(greentest.TestCase):
                 pid = os.fork()
                 if pid == 0:
                     os._exit(0)
-                os.waitpid(pid, 0)
+                # Not os.waitpid(pid, 0): see greentest.wait_for_child.
+                greentest.wait_for_child(pid, timeout=20)
                 gevent.sleep(0.01)
         finally:
             stop.append(1)

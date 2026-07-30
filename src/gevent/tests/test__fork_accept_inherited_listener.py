@@ -138,10 +138,10 @@ class Test(greentest.TestCase):
         stop.append(1)
         gevent.joinall(busies, timeout=10)
 
-        statuses = []
-        for pid in children:
-            with gevent.Timeout(20):
-                statuses.append(os.waitpid(pid, 0)[1])
+        # Not os.waitpid(pid, 0): see greentest.wait_for_child. Both children
+        # exit at once here, which is the arrangement that loses that race most
+        # often.
+        statuses = [greentest.wait_for_child(pid, timeout=20) for pid in children]
         listener.close()
 
         self.assertEqual(statuses, [0] * self.WORKERS)
